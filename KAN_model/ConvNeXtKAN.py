@@ -1,0 +1,126 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
+from torchsummary import summary
+import gc
+import matplotlib.pyplot as plt
+
+# Import KANLayer from your KAN file
+from version.kan.kan import KANLayer
+
+class ConvNeXtKAN(nn.Module):
+    """ConvNeXt + KANLayer implementation"""
+    def __init__(self, num_classes=11,  kan_num_grids=5, kan_spline_order=3, pretrained=True):
+        super(ConvNeXtKAN, self).__init__()
+        
+        # Load pre-trained ConvNeXt model
+        self.convnext = models.convnext_base(weights=None if not pretrained else "DEFAULT")
+
+        # Freeze ConvNeXt layers (if required)
+        for param in self.convnext.parameters():
+            param.requires_grad = False
+
+        # Get the number of features from ConvNeXt classifier
+        num_features = self.convnext.classifier[2].in_features
+        
+        # Replace the classifier with Identity to get raw features
+        self.convnext.classifier = nn.Identity()
+
+        # Create KANLayer network
+        # First layer: ConvNeXt features -> hidden layer
+        self.kan_layer1 = KANLayer(
+            in_dim=num_features, 
+            out_dim=256, 
+            num=kan_num_grids,           # number of grid intervals
+            k=kan_spline_order,             # spline order
+            noise_scale=0.1, 
+            scale_base_mu=0.0,
+            scale_base_sigma=1.0,
+            scale_sp=1.0,
+            base_fun=torch.nn.SiLU(),
+            grid_eps=0.02,
+            grid_range=[-1, 1],
+            sp_trainable=True,
+            sb_trainable=True,
+            device='cpu'  # Will be moved to correct device later
+        )
+        
+        # Second layer: hidden layer -> output classes
+        self.kan_layer2 = KANLayer(
+            in_dim=256,
+            out_dim=num_classes,
+            num=5,
+            k=3,
+            noise_scale=0.1,
+            scale_base_mu=0.0,
+            scale_base_sigma=1.0,
+            scale_sp=1.0,
+            base_fun=torch.nn.SiLU(),
+            grid_eps=0.02,
+            grid_range=[-1, 1],
+            sp_trainable=True,
+            sb_trainable=True,
+            device='cpu'
+        )
+
+    def forward(self, x):
+        """Forward pass through the network"""
+        # Extract features using ConvNeXt
+        x = self.convnext(x)
+        x = x.view(x.size(0), -1)  # Flatten the tensor
+        
+        # Pass through KANLayers
+        # KANLayer.forward returns (y, preacts, postacts, postspline)
+        # We only need y (the main output)
+        output_kan1 = self.kan_layer1(x)
+        x = output_kan1[0]
+        output_kan2 = self.kan_layer2(x)
+        x = output_kan2[0]
+        
+        return x
+
+def print_parameter_details(model):
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            params = parameter.numel()  # Number of elements in the tensor
+            total_params += params
+            print(f"{name}: {params}")
+    print(f"Total trainable parameters: {total_params}")
+    
+
+def count_model_size(model):
+    """Calculate model size in MB"""
+    param_size = 0
+    buffer_size = 0
+    
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+    
+    size_mb = (param_size + buffer_size) / 1024 / 1024
+    return size_mb
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = ConvNeXtKAN().to(device)
+print(model)
+print_parameter_details(model)
+count_model_size(model)
+print(f"Model size: {count_model_size(model):.2f} MB")
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+print(f"Total trainable parameters: {count_parameters(model)}")
+
+# Clean up
+print("\nCleaning up...")
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    
+print("Done! ConvNeXt + Regular KAN implementation complete.")
